@@ -1,0 +1,9 @@
+#!/bin/bash
+echo "Recursive uncompress starting from: $(pwd)"
+
+find . -type f \( -name "*.tar.gz" -o -name "*.tgz" \) -execdir tar -xzf "{}" \; -exec rm "{}" \;
+find . -type f -name "*.tar" -execdir tar -xf "{}" \; -exec rm "{}" \;
+find . -type f -name "*.zip" -execdir unzip -o "{}" \; -exec rm "{}" \;
+find . -type f -name "*.gz" ! -name "*.tar.gz" -execdir gunzip "{}" \;
+
+echo "Done."

@@ -275,7 +275,10 @@ def main():
     )
     parser.add_argument(
         "folder",
-        help="Cartella contenente i file XML dei report DMARC",
+        nargs='?',
+        default=Path('.'),
+        type=Path,
+        help="Cartella contenente i file XML dei report DMARC (default: cartella corrente)",
     )
     parser.add_argument(
         "--api-key",

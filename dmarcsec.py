@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-DMARC XML Report + AbuseIPDB Lookup
+DMARC XML Report Analyzer + AbuseIPDB Lookup
 Analizza file XML di report DMARC, estrae gli IP con SPF auth = "fail"
 e li verifica tramite l'API di AbuseIPDB.
 
 Uso:
-    python dmarcsec.py <cartella_xml> --api-key <ABUSEIPDB_API_KEY>
+    python dmarc_abuseipdb.py <cartella_xml> --api-key <ABUSEIPDB_API_KEY>
 
 Opzioni:
-    --api-key       API key di AbuseIPDB (oppure variabile d'ambiente ABUSEIPDB_API_KEY)
-    --max-age-days  Numero di giorni per il lookup AbuseIPDB (default: 90)
-    --output        File CSV di output con i trigger fail (opzionale)
-    --verbose       Mostra dettagli aggiuntivi durante l'elaborazione
+    -k, --api-key       API key di AbuseIPDB (oppure variabile d'ambiente ABUSEIPDB_API_KEY)
+    -m, --max-age-days  Numero di giorni per il lookup AbuseIPDB (default: 90)
+    -o, --output        File CSV di output con i risultati (opzionale)
+    -v, --verbose       Mostra dettagli aggiuntivi durante l'elaborazione
+    -d, --delay         Secondi di attesa tra chiamate API (default: 1.0)
+    -r, --remove        Elimina i file XML dopo l'analisi
+    -l, --log           Accoda i record SPF-fail a 'analisi.log' nella cartella corrente
 """
 
 import os
 import sys
+import gzip
+import shutil
+import tarfile
+import zipfile
 import argparse
 import xml.etree.ElementTree as ET
 import requests
@@ -25,6 +32,79 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
+
+
+# ──────────────────────────────────────────────
+# Decompressione archivi
+# ──────────────────────────────────────────────
+
+def estrai_archivi(folder: Path, verbose: bool = False):
+    """
+    Equivalente Python di rexplode: estrae tutti gli archivi presenti
+    nella cartella target e rimuove i file sorgente dopo l'estrazione.
+    Gestisce: .tar.gz / .tgz, .tar, .zip, .gz (singolo file).
+    """
+
+    def _rimuovi(path: Path):
+        try:
+            path.unlink()
+            if verbose:
+                print(f"  [arch] Rimosso archivio: {path.name}")
+        except OSError as e:
+            print(f"  [!] Impossibile rimuovere '{path.name}': {e}")
+
+    # .tar.gz e .tgz
+    for arch in list(folder.rglob("*.tar.gz")) + list(folder.rglob("*.tgz")):
+        if arch.name.startswith("._"):
+            continue
+        try:
+            with tarfile.open(arch, "r:gz") as tf:
+                tf.extractall(path=arch.parent)
+            if verbose:
+                print(f"  [arch] Estratto: {arch.name}")
+            _rimuovi(arch)
+        except Exception as e:
+            print(f"  [!] Errore estrazione '{arch.name}': {e}")
+
+    # .tar
+    for arch in folder.rglob("*.tar"):
+        if arch.name.startswith("._"):
+            continue
+        try:
+            with tarfile.open(arch, "r:") as tf:
+                tf.extractall(path=arch.parent)
+            if verbose:
+                print(f"  [arch] Estratto: {arch.name}")
+            _rimuovi(arch)
+        except Exception as e:
+            print(f"  [!] Errore estrazione '{arch.name}': {e}")
+
+    # .zip
+    for arch in folder.rglob("*.zip"):
+        if arch.name.startswith("._"):
+            continue
+        try:
+            with zipfile.ZipFile(arch, "r") as zf:
+                zf.extractall(path=arch.parent)
+            if verbose:
+                print(f"  [arch] Estratto: {arch.name}")
+            _rimuovi(arch)
+        except Exception as e:
+            print(f"  [!] Errore estrazione '{arch.name}': {e}")
+
+    # .gz singolo file (non .tar.gz)
+    for arch in folder.rglob("*.gz"):
+        if arch.name.startswith("._") or arch.name.endswith(".tar.gz"):
+            continue
+        dest = arch.parent / arch.stem  # rimuove .gz dal nome
+        try:
+            with gzip.open(arch, "rb") as gz_in, open(dest, "wb") as f_out:
+                shutil.copyfileobj(gz_in, f_out)
+            if verbose:
+                print(f"  [arch] Estratto: {arch.name} → {dest.name}")
+            _rimuovi(arch)
+        except Exception as e:
+            print(f"  [!] Errore estrazione '{arch.name}': {e}")
 
 
 # ──────────────────────────────────────────────
@@ -227,11 +307,11 @@ def print_result(record: dict, abuse_data: dict | None):
     # Colore in base al punteggio
     if isinstance(score, int):
         if score >= 75:
-            risk = "🔴 RISCHIO ALTO  "
+            risk = "🔴 ALTO RISCHIO"
         elif score >= 25:
-            risk = "🟠 RISCHIO MEDIO "
+            risk = "🟠 RISCHIO MEDIO"
         else:
-            risk = "🟢 RISCHIO BASSO "
+            risk = "🟢 BASSO RISCHIO"
     else:
         risk = "⚪ N/A"
 
@@ -265,6 +345,52 @@ def save_csv(results: list[dict], output_path: str):
     print(f"\n✅ Risultati salvati in: {output_path}")
 
 
+def append_log(records: list[dict], log_path: str = "analisi.log"):
+    """
+    Accoda al file analisi.log i record SPF-fail con i relativi dati AbuseIPDB.
+    Ogni sessione è separata da un'intestazione con timestamp.
+    """
+    if not records:
+        return
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    separator = "─" * 60
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"  Analisi del {now}\n")
+        f.write(f"{'='*60}\n")
+
+        for r in records:
+            score = r.get("abuse_confidence_score", "N/A")
+            if isinstance(score, int):
+                if score >= 75:
+                    risk = "ALTO RISCHIO"
+                elif score >= 25:
+                    risk = "RISCHIO MEDIO"
+                else:
+                    risk = "BASSO RISCHIO"
+            else:
+                risk = "N/A"
+
+            f.write(f"\n{separator}\n")
+            f.write(f"  IP:              {r.get('source_ip', '')}\n")
+            f.write(f"  File sorgente:   {r.get('file', '')}  (report: {r.get('report_id', '')})\n")
+            f.write(f"  Dominio DMARC:   {r.get('policy_domain', '')} | Header-From: {r.get('header_from', '')}\n")
+            f.write(f"  Periodo:         {r.get('date_begin', '')} → {r.get('date_end', '')}\n")
+            f.write(f"  Messaggi:        {r.get('count', '')} | Disposition: {r.get('dmarc_disposition', '')}\n")
+            f.write(f"  SPF domain:      {r.get('spf_domain', '')} | scope: {r.get('spf_scope', '')}\n")
+            f.write(f"  DKIM eval:       {r.get('dkim_eval', '')} | SPF eval: {r.get('spf_eval', '')}\n")
+            f.write(f"  AbuseIPDB Score: {score}/100  [{risk}]\n")
+            f.write(f"  Paese:           {r.get('country_code', '??')} | ISP: {r.get('isp', 'N/A')}\n")
+            f.write(f"  Segnalazioni:    {r.get('total_reports', 0)} (ultimo: {r.get('last_reported_at', 'mai')})\n")
+            f.write(f"  Usage type:      {r.get('usage_type', '')} | TOR: {r.get('is_tor', False)}\n")
+
+        f.write(f"\n{'='*60}\n")
+
+    print(f"\n📝 Log accodato in: {log_path}  ({len(records)} record)")
+
+
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
@@ -281,31 +407,41 @@ def main():
         help="Cartella contenente i file XML dei report DMARC (default: cartella corrente)",
     )
     parser.add_argument(
-        "--api-key",
+        "-k", "--api-key",
         default=os.environ.get("ABUSEIPDB_API_KEY", ""),
         help="API key di AbuseIPDB (o variabile d'ambiente ABUSEIPDB_API_KEY)",
     )
     parser.add_argument(
-        "--max-age-days",
+        "-m", "--max-age-days",
         type=int,
         default=90,
         help="Finestra temporale per i report AbuseIPDB in giorni (default: 90)",
     )
     parser.add_argument(
-        "--output",
+        "-o", "--output",
         default="",
         help="File CSV di output con i risultati (opzionale)",
     )
     parser.add_argument(
-        "--verbose",
+        "-v", "--verbose",
         action="store_true",
         help="Mostra dettagli aggiuntivi",
     )
     parser.add_argument(
-        "--delay",
+        "-d", "--delay",
         type=float,
         default=1.0,
         help="Secondi di attesa tra una chiamata API e l'altra (default: 1.0)",
+    )
+    parser.add_argument(
+        "-r", "--remove",
+        action="store_true",
+        help="Elimina i file XML dalla cartella dopo l'analisi",
+    )
+    parser.add_argument(
+        "-l", "--log",
+        action="store_true",
+        help="Accoda i record SPF-fail a 'analisi.log' nella cartella corrente",
     )
 
     args = parser.parse_args()
@@ -321,11 +457,23 @@ def main():
         print("[ERRORE] API key mancante. Usa --api-key oppure imposta ABUSEIPDB_API_KEY.")
         sys.exit(1)
 
-    # Ricerca file XML
-    xml_files = sorted(folder.glob("*.xml"))
+    # Decompressione archivi
+    estrai_archivi(folder, verbose=args.verbose)
+
+    # Rimozione file ._* generati da macOS (dopo rexplode)
+    for mac_file in folder.glob("._*"):
+        try:
+            mac_file.unlink()
+            if args.verbose:
+                print(f"  [macOS] Rimosso: {mac_file.name}")
+        except OSError as e:
+            print(f"  [!] Impossibile rimuovere '{mac_file.name}': {e}")
+
+    # Ricerca file XML (escludi comunque eventuali ._* residui)
+    xml_files = sorted(f for f in folder.glob("*.xml") if not f.name.startswith("._"))
     if not xml_files:
         # Prova anche file .gz decompressi o con altro case
-        xml_files = sorted(folder.glob("**/*.xml"))
+        xml_files = sorted(f for f in folder.glob("**/*.xml") if not f.name.startswith("._"))
 
     if not xml_files:
         print(f"[!] Nessun file XML trovato in '{folder}'.")
@@ -350,6 +498,19 @@ def main():
             all_fail_records.extend(records)
         elif args.verbose:
             print(f"  - {xml_file.name}: nessun SPF fail")
+
+    # ── Rimozione file XML (prima di qualsiasi exit anticipato) ──
+    if args.remove:
+        removed = 0
+        for xml_file in xml_files:
+            try:
+                xml_file.unlink()
+                removed += 1
+                if args.verbose:
+                    print(f"  [rm] Rimosso: {xml_file.name}")
+            except OSError as e:
+                print(f"  [!] Impossibile rimuovere '{xml_file.name}': {e}")
+        print(f"🗑️  Rimossi {removed} file XML dalla cartella '{folder}'.\n")
 
     if not all_fail_records:
         print("\n✅ Nessun record con SPF auth = 'fail' trovato nei file analizzati.")
@@ -394,6 +555,10 @@ def main():
     if args.output:
         save_csv(csv_rows, args.output)
 
+    # ── Step 5: Log ──
+    if args.log:
+        append_log(csv_rows)
+
     # ── Riepilogo finale ──
     print(f"\n{'='*60}")
     print("  RIEPILOGO FINALE")
@@ -407,7 +572,7 @@ def main():
                 if d and d.get("abuse_confidence_score", 0) < 25]
     no_data = [ip for ip, d in abuse_cache.items() if d is None]
 
-    print(f"  🔴 Rischio alto  (score ≥ 75): {len(high_risk)} IP")
+    print(f"  🔴 Alto rischio  (score ≥ 75): {len(high_risk)} IP")
     for ip, d in high_risk:
         print(f"      {ip:20s} score={d['abuse_confidence_score']:3d}  [{d.get('country_code','??')}] {d.get('isp','')}")
 
@@ -415,7 +580,7 @@ def main():
     for ip, d in medium_risk:
         print(f"      {ip:20s} score={d['abuse_confidence_score']:3d}  [{d.get('country_code','??')}] {d.get('isp','')}")
 
-    print(f"  🟢 Rischio basso (score < 25): {len(low_risk)} IP")
+    print(f"  🟢 Basso rischio (score < 25): {len(low_risk)} IP")
     print(f"  ⚪ Dati non disponibili:        {len(no_data)} IP")
     print(f"{'='*60}\n")
 

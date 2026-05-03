@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DMARC XML Report Analyzer + AbuseIPDB Lookup
+DMARC XML Report Analyzer and AbuseIPDB Lookup
 Analizza file XML di report DMARC, estrae gli IP con SPF auth = "fail"
 e li verifica tramite l'API di AbuseIPDB.
 
@@ -13,29 +13,19 @@ Opzioni:
     -o, --output        File CSV di output con i risultati (opzionale)
     -v, --verbose       Mostra dettagli aggiuntivi durante l'elaborazione
     -d, --delay         Secondi di attesa tra chiamate API (default: 1.0)
-    -r, --remove        Elimina i file XML dopo l'analisi
+    -r, --report        Segnala ad AbuseIPDB gli indirizzi malevoli
+    -e, --erase         Elimina i file XML dopo l'analisi
     -l, --log           Accoda i record SPF-fail a 'analisi.log' nella cartella corrente
 """
 
-import os
-import sys
-import gzip
-import shutil
-import tarfile
-import zipfile
-import argparse
+import os, sys, gzip, request, shutil, tarfile, zipfile, argparse, json, csv, time
 import xml.etree.ElementTree as ET
-import requests
-import json
-import csv
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 
-
 # ──────────────────────────────────────────────
-# Decompressione archivi
+# Decompressione archivi (Mac OSX-friendly)
 # ──────────────────────────────────────────────
 
 def estrai_archivi(folder: Path, verbose: bool = False):
@@ -106,6 +96,41 @@ def estrai_archivi(folder: Path, verbose: bool = False):
         except Exception as e:
             print(f"  [!] Errore estrazione '{arch.name}': {e}")
 
+def report_abuseipdb(ip: str, api_key: str, categories: list[int], comment: str = "") -> bool:
+    """
+    Segnala un IP ad AbuseIPDB tramite l'endpoint /v2/report.
+    categories: lista di interi (vedi https://www.abuseipdb.com/categories)
+    Restituisce True se la segnalazione è andata a buon fine.
+    """
+    url = "https://api.abuseipdb.com/api/v2/report"
+    headers = {
+        "Key": api_key,
+        "Accept": "application/json",
+    }
+    payload = {
+        "ip": ip,
+        "categories": ",".join(str(c) for c in categories),
+        "comment": comment,
+    }
+
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=10)
+        if response.status_code == 200:
+            data = response.json().get("data", {})
+            score = data.get("abuseConfidenceScore", "?")
+            print(f"  ✅ Segnalato {ip} — nuovo score: {score}/100")
+            return True
+        elif response.status_code == 429:
+            print("  [!] Rate limit — attendo 60s...")
+            time.sleep(60)
+            return report_abuseipdb(ip, api_key, categories, comment)
+        else:
+            err = response.json().get("errors", [{}])
+            print(f"  [!] Errore segnalazione {ip}: HTTP {response.status_code} — {err}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"  [!] Errore di rete per {ip}: {e}")
+        return False
 
 # ──────────────────────────────────────────────
 # Parsing DMARC XML
@@ -231,7 +256,6 @@ def parse_dmarc_xml(filepath: Path) -> list[dict]:
 
     return fail_records
 
-
 # ──────────────────────────────────────────────
 # AbuseIPDB API
 # ──────────────────────────────────────────────
@@ -290,7 +314,6 @@ def check_abuseipdb(ip: str, api_key: str, max_age_days: int = 90) -> dict | Non
         print(f"  [!] Errore di rete per {ip}: {e}")
         return None
 
-
 # ──────────────────────────────────────────────
 # Output e Report
 # ──────────────────────────────────────────────
@@ -323,9 +346,8 @@ def print_result(record: dict, abuse_data: dict | None):
     print(f"  Paese:           {country} | ISP: {isp}")
     print(f"  Segnalazioni:    {reports} (ultimo: {last_seen})")
 
-
 def save_csv(results: list[dict], output_path: str):
-    """Salva i risultati in un file CSV."""
+    """Salva i risultati in un file CSV accodandoli se il file esiste già."""
     if not results:
         return
 
@@ -337,12 +359,18 @@ def save_csv(results: list[dict], output_path: str):
         "file", "report_id",
     ]
 
-    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+    # Controlliamo se il file esiste già e se ha una dimensione > 0
+    file_esiste = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+    with open(output_path, "a", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
+        
+        # Scriviamo l'header SOLO se il file è nuovo o vuoto
+        if not file_esiste:
+            writer.writeheader()
+            
         writer.writerows(results)
 
-    print(f"\n✅ Risultati salvati in: {output_path}")
+    print(f"\n✅ Risultati accodati in: {output_path}")
 
 
 def append_log(records: list[dict], log_path: str = "analisi.log"):
@@ -390,7 +418,6 @@ def append_log(records: list[dict], log_path: str = "analisi.log"):
 
     print(f"\n📝 Log accodato in: {log_path}  ({len(records)} record)")
 
-
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
@@ -434,7 +461,7 @@ def main():
         help="Secondi di attesa tra una chiamata API e l'altra (default: 1.0)",
     )
     parser.add_argument(
-        "-r", "--remove",
+        "-e", "--erase",
         action="store_true",
         help="Elimina i file XML dalla cartella dopo l'analisi",
     )
@@ -442,6 +469,32 @@ def main():
         "-l", "--log",
         action="store_true",
         help="Accoda i record SPF-fail a 'analisi.log' nella cartella corrente",
+    )
+    parser.add_argument(
+        "-r", "--report",
+        action="store_true",
+        help="Segnala gli IP con SPF fail ad AbuseIPDB tramite API",
+    )
+    parser.add_argument(
+        "--report-categories",
+        default="11,17",
+        help=(
+            "Categorie AbuseIPDB separate da virgola (default: '11,17' = "
+            "Email spam, Spoofing). "
+            "Vedi https://www.abuseipdb.com/categories"
+        ),
+    )
+    parser.add_argument(
+        "--report-comment",
+        default="IP address identified by DMARC report",
+        #default="IP address abusing domain rules in DMARC report",
+        help="Commento allegato alla segnalazione (default: messaggio generico DMARC)",
+    )
+    parser.add_argument(
+        "--report-min-score",
+        type=int,
+        default=0,
+        help="Segnala solo gli IP con abuse score >= a questo valore (default: 0 = tutti)",
     )
 
     args = parser.parse_args()
@@ -480,7 +533,7 @@ def main():
         sys.exit(0)
 
     print(f"\n{'='*60}")
-    print(f"  DMARC SPF-Fail Analyzer + AbuseIPDB Lookup")
+    print(f"  DMARC SPF-Fail Analyzer + AbuseIPDB Lookup & Report")
     print(f"{'='*60}")
     print(f"  Cartella:    {folder.resolve()}")
     print(f"  File XML:    {len(xml_files)}")
@@ -500,7 +553,7 @@ def main():
             print(f"  - {xml_file.name}: nessun SPF fail")
 
     # ── Rimozione file XML (prima di qualsiasi exit anticipato) ──
-    if args.remove:
+    if args.erase:
         removed = 0
         for xml_file in xml_files:
             try:
@@ -544,6 +597,35 @@ def main():
         if i < len(unique_ips):
             time.sleep(args.delay)
 
+    # ── Step 2b: Report ad AbuseIPDB (opzionale) ──
+    if args.report:
+        try:
+            report_categories = [int(c.strip()) for c in args.report_categories.split(",")]
+        except ValueError:
+            print("[ERRORE] --report-categories deve contenere interi separati da virgola.")
+            sys.exit(1)
+
+        print(f"\n[AbuseIPDB] Segnalazione IP in corso (categorie: {report_categories})...\n")
+        reported = 0
+        skipped = 0
+
+        for ip, abuse_data in abuse_cache.items():
+            score = abuse_data.get("abuse_confidence_score", 0) if abuse_data else 0
+            if score < args.report_min_score:
+                if args.verbose:
+                    print(f"  [skip] {ip} — score {score} < soglia {args.report_min_score}")
+                skipped += 1
+                continue
+
+            print(f"  → Segnalazione: {ip} (score attuale: {score})")
+            success = report_abuseipdb(ip, args.api_key, report_categories, args.report_comment)
+            if success:
+                reported += 1
+            if ip != list(abuse_cache.keys())[-1]:
+                time.sleep(args.delay)
+
+        print(f"\n  📨 Segnalati: {reported} IP  |  Saltati (sotto soglia): {skipped} IP")
+
     # ── Step 3: Costruzione righe CSV (tutti i record, con dati abuse) ──
     for record in all_fail_records:
         ip = record["source_ip"]
@@ -583,7 +665,6 @@ def main():
     print(f"  🟢 Basso rischio (score < 25): {len(low_risk)} IP")
     print(f"  ⚪ Dati non disponibili:        {len(no_data)} IP")
     print(f"{'='*60}\n")
-
 
 if __name__ == "__main__":
     main()
